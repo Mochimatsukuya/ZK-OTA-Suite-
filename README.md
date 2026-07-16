@@ -1,2 +1,12 @@
-# ZK-OTA-Suite-
-Reverse-engineered OTA update protocol for ZK-based BLE smartwatches. Includes Python OTA client, Android OTA module, and full protocol documentation.
+# Legacy / Original Files
+
+This branch contains the original reverse-engineered files from the ZK smartwatch OTA system.
+
+These files are **not used** in the final OTA tools.  
+They exist only for reference, documentation, and historical context.
+
+Contents:
+- Decompiled Java from the original APK
+- Smali fragments
+- Early Python BLE scripts
+- Notes from the reverse-engineering process
