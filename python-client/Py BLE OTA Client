@@ -1,0 +1,154 @@
+import asyncio
+from bleak import BleakClient
+
+UUID_READ      = "0000e91b-0000-1000-8000-00805f9b34fb"  # BleConstant.UUID_READ
+UUID_WRITE_ZK  = "0000e91d-0000-1000-8000-00805f9b34fb"  # BleConstant.UUID_WRITE_ZK
+
+MTU            = 245
+BLOCK_SIZE     = 4096   # default, can be updated from device
+PACKET_SIZE    = 512    # default, can be updated from device
+
+class ZKOtaPythonClient:
+    def __init__(self, address, firmware_bytes):
+        self.address = address
+        self.fw = firmware_bytes
+        self.block_size = BLOCK_SIZE
+        self.packet_size = PACKET_SIZE
+        self.offset = 0
+        self.seq = 0
+        self.allowed_update = False
+
+    def _next_seq(self):
+        val = self.seq
+        self.seq = (self.seq + 1) & 0xFF
+        return val
+
+    async def _write(self, client: BleakClient, data: bytes):
+        await client.write_gatt_char(UUID_WRITE_ZK, data, response=True)
+
+    async def _send_get_all_info(self, client: BleakClient):
+        # opcode -110 (0x92), seq, then TLV request for types 1..6
+        op = 0x92
+        seq = self._next_seq()
+        payload = bytes([op, seq]) + b"\x01\x03\x04\x05\x06"
+        await self._write(client, payload)
+
+    async def _send_get_ota_info_version(self, client: BleakClient):
+        # opcode -111 (0x91), seq, type=1
+        op = 0x91
+        seq = self._next_seq()
+        payload = bytes([op, seq, 0x01])
+        await self._write(client, payload)
+
+    async def _send_fw_version_and_md5(self, client: BleakClient, ota_version: int):
+        import hashlib
+        md5 = hashlib.md5(self.fw).digest()
+        op = 0x91
+        seq = self._next_seq()
+        # type=2, version (short LE), first 4 bytes of MD5
+        payload = bytearray()
+        payload.append(op)
+        payload.append(seq)
+        payload.append(0x02)
+        payload += ota_version.to_bytes(2, "little")
+        payload += md5[:4]
+        await self._write(client, bytes(payload))
+
+    async def _send_block(self, client: BleakClient):
+        # opcode -96 (0xA0), seq, offset, length, data
+        op = 0xA0
+        seq = self._next_seq()
+        start = self.offset
+        remaining = len(self.fw) - start
+        if remaining <= 0:
+            return
+        length = min(remaining, self.block_size)
+        header = bytearray()
+        header.append(op)
+        header.append(seq)
+        header += start.to_bytes(4, "little")
+        header += length.to_bytes(4, "little")
+        chunk = self.fw[start:start+length]
+        packet = bytes(header) + chunk
+        await self._write(client, packet)
+        self.offset += length
+
+    async def _notification_handler(self, sender, data: bytes):
+        # This mirrors g.u(byte[])
+        op = data[0]
+        seq = data[1]
+        body = data[2:]
+
+        if op == 0x90:  # -112 status
+            status = body[0]
+            if status == 0x00:
+                # OK, send next block if any
+                if self.offset < len(self.fw):
+                    # send next block
+                    self._pending_next_block = True
+                else:
+                    # wait for final status
+                    pass
+            elif status == 0xFF:  # -1 done
+                # OTA finished
+                self._done = True
+            elif status == 0xFD:  # -3 pause/forbidden
+                self._error = "update forbidden or paused"
+            elif status == 0xFE:  # -2 resume
+                # device wants resume → request info again
+                self._pending_get_info = True
+            else:
+                self._error = f"status error {status}"
+        elif op == 0x91:  # -111 info
+            info_type = body[0]
+            payload = body[1:]
+            if info_type == 1:
+                # device FW version, then we send MD5+version
+                dev_ver = int.from_bytes(payload[:2], "little")
+                # choose ota_version (e.g. same or newer)
+                ota_version = dev_ver + 1
+                self._pending_send_md5 = ota_version
+            elif info_type == 2:
+                # allowedUpdate decision
+                if self.allowed_update:
+                    self._pending_start_blocks = True
+                else:
+                    self._error = "device not allowed to update"
+        elif op == 0x92:  # -110 TLV info
+            # parse TLV if needed (TWS, channel, etc.)
+            pass
+        elif op == 0x93:  # -109 version string
+            # optional: parse version string
+            pass
+
+    async def run(self):
+        async with BleakClient(self.address) as client:
+            await client.start_notify(UUID_READ, self._notification_handler)
+
+            # step 1: get all info + version
+            await self._send_get_all_info(client)
+            await self._send_get_ota_info_version(client)
+
+            # main loop
+            self._pending_next_block = False
+            self._pending_get_info = False
+            self._pending_send_md5 = None
+            self._pending_start_blocks = False
+            self._done = False
+            self._error = None
+
+            while not self._done and not self._error:
+                if self._pending_send_md5 is not None:
+                    await self._send_fw_version_and_md5(client, self._pending_send_md5)
+                    self._pending_send_md5 = None
+                elif self._pending_start_blocks:
+                    await self._send_block(client)
+                    self._pending_start_blocks = False
+                elif self._pending_next_block:
+                    await self._send_block(client)
+                    self._pending_next_block = False
+                else:
+                    await asyncio.sleep(0.1)
+
+            await client.stop_notify(UUID_READ)
+            return {"done": self._done, "error": self._error}
